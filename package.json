@@ -1,0 +1,40 @@
+{
+  "name": "@solvedbook/mcp-server",
+  "version": "1.0.0",
+  "description": "SolvedBook Model Context Protocol server for AI case management with Q-learning",
+  "main": "src/mcp-server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/mcp-server.js",
+    "dev": "nodemon src/mcp-server.js",
+    "test": "node test-mcp-server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "dotenv": "^16.0.3",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.7"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ai",
+    "q-learning",
+    "case-management",
+    "machine-learning"
+  ],
+  "author": "SolvedBook Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/solvedbook/mcp-server.git"
+  },
+  "mcp": {
+    "server": {
+      "name": "solvedbook",
+      "version": "1.0.0"
+    }
+  }
+}

@@ -1,0 +1,56 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: solvedbook-postgres
+    environment:
+      POSTGRES_USER: solvedbook
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: solvedbook
+      POSTGRES_HOST_AUTH_METHOD: md5
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U solvedbook"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - solvedbook-network
+
+  app:
+    build: .
+    container_name: solvedbook-app
+    env_file:
+      - .env.docker
+    environment:
+      NODE_ENV: production
+      DB_USER: solvedbook
+      DB_PASSWORD: password
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: solvedbook
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - solvedbook-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+
+networks:
+  solvedbook-network:
+    driver: bridge

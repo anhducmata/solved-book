@@ -1,0 +1,18 @@
+services:
+  app:
+    build:
+      context: .
+      args:
+        NODE_ENV: development
+    environment:
+      NODE_ENV: development
+    volumes:
+      - .:/app
+      - /app/node_modules
+    command: npm run dev
+    
+  postgres:
+    ports:
+      - "5432:5432"  # Different port mapping for development
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust  # Less secure but convenient for dev
