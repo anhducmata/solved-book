@@ -1,5 +1,5 @@
 # SolvedBook Smart MCP Server
-
+Read more: https://arxiv.org/pdf/2508.16153
 A **Model Context Protocol (MCP)** server with **advanced AI capabilities** that provides intelligent case management with sophisticated Q-learning, semantic analysis, and predictive recommendations.
 
 ## 🚀 Quick Start
