@@ -22,6 +22,7 @@ import {
 import { config } from 'dotenv';
 import { getDatabase, initializeDatabase } from './config/database.js';
 import http from 'http';
+import { ContextEnrichment } from './core/context-enrichment.js';
 
 // Load environment variables
 config();
@@ -376,6 +377,40 @@ class SolvedBookMCPServer {
               required: ['case_id', 'feedback_type'],
             },
           },
+          {
+            name: 'add_case_from_conversation',
+            description: 'Add a case to the knowledge base from a question and answer pair (captures previous conversation context)',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                question: { type: 'string', description: 'The question that was asked' },
+                answer: { type: 'string', description: 'The answer provided' },
+                tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for categorization (will be auto-extracted if not provided)' },
+                case_id: { type: 'string', description: 'Optional: Custom case ID (will be auto-generated if not provided)' },
+                category: { type: 'string', description: 'Optional category (e.g., "performance", "optimization", "computer-science")' },
+              },
+              required: ['question', 'answer'],
+            },
+          },
+          {
+            name: 'enrich_context',
+            description: 'Extract query-relevant content from cases to create focused prompt context. Uses similarity-based attribution to identify and include only the most relevant parts of case solutions.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                query: { type: 'string', description: 'The query/question for which to enrich context' },
+                case_ids: { type: 'array', items: { type: 'string' }, description: 'Optional: Specific case IDs to enrich. If not provided, will retrieve relevant cases automatically.' },
+                mode: { type: 'string', enum: ['parametric', 'non-parametric'], description: 'Retrieval mode if case_ids not provided: parametric (Q-value based) or non-parametric (similarity based) (default: parametric)' },
+                top_k: { type: 'number', description: 'Number of cases to enrich (default: 5)' },
+                max_sentences_per_case: { type: 'number', description: 'Maximum sentences to extract from each case solution (default: 3)' },
+                min_relevance_score: { type: 'number', description: 'Minimum relevance score for sentence inclusion (default: 0.1)' },
+                format: { type: 'string', enum: ['text', 'json'], description: 'Output format: text (for prompt inclusion) or json (structured data) (default: text)' },
+                include_full_solution: { type: 'boolean', description: 'Include full solution in addition to relevant content (default: false)' },
+                tags: { type: 'array', items: { type: 'string' }, description: 'Optional: Filter cases by tags (only used if case_ids not provided)' },
+              },
+              required: ['query'],
+            },
+          },
         ],
       };
     });
@@ -408,6 +443,13 @@ class SolvedBookMCPServer {
           
           case 'submit_feedback':
             return await this.handleSubmitFeedback(db, args);
+
+
+          case 'add_case_from_conversation':
+            return await this.handleAddCaseFromConversation(db, args);
+
+          case 'enrich_context':
+            return await this.handleEnrichContext(db, args);
 
           default:
             throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
@@ -662,6 +704,234 @@ class SolvedBookMCPServer {
                 `• Thank you for helping train our AI system!`,
         },
       ],
+    };
+  }
+  async handleAddCaseFromConversation(db, args) {
+    const { question, answer, tags = [], case_id = null, category = null } = args;
+
+    // Validate required fields
+    if (!question || !answer) {
+      throw new McpError(ErrorCode.InvalidParams, 'question and answer are required');
+    }
+
+    try {
+      // Generate case_id if not provided
+      let finalCaseId = case_id;
+      if (!finalCaseId) {
+        // Generate a readable case ID from the question
+        const slug = question
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '')
+          .substring(0, 50);
+        finalCaseId = `conversation-${slug}-${Date.now()}`;
+      }
+
+      // Check if case already exists
+      const existing = await db.query('SELECT case_id FROM cases WHERE case_id = $1', [finalCaseId]);
+      if (existing.rows.length > 0) {
+        // Update existing case
+        finalCaseId = `${finalCaseId}-${Date.now()}`;
+      }
+
+      // Auto-extract tags if not provided
+      let finalTags = tags.length > 0 ? tags : this.extractTagsFromQuestion(question);
+
+      // Build solution object
+      const solution = {
+        description: `Knowledge captured from conversation: ${question}`,
+        question: question,
+        answer: answer,
+        source: 'conversation',
+        category: category || 'general',
+        capturedAt: new Date().toISOString(),
+      };
+
+      // Insert case into database
+      const sql = `INSERT INTO cases (case_id, task, tags, solution) VALUES ($1, $2, $3, $4)`;
+      await db.query(sql, [
+        finalCaseId,
+        question,
+        JSON.stringify(finalTags),
+        JSON.stringify(solution),
+      ]);
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `✅ Case added to knowledge base:\n` +
+                  `• Case ID: ${finalCaseId}\n` +
+                  `• Question: ${question.substring(0, 100)}${question.length > 100 ? '...' : ''}\n` +
+                  `• Tags: ${finalTags.join(', ')}\n` +
+                  `• Category: ${category || 'general'}`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Failed to add case from conversation: ${error.message}`);
+    }
+  }
+
+  async handleEnrichContext(db, args) {
+    const {
+      query,
+      case_ids = null,
+      mode = 'parametric',
+      top_k = 5,
+      max_sentences_per_case = 3,
+      min_relevance_score = 0.1,
+      format = 'text',
+      include_full_solution = false,
+      tags = []
+    } = args;
+
+    try {
+      let cases = [];
+
+      // If specific case IDs provided, fetch those cases
+      if (case_ids && case_ids.length > 0) {
+        const placeholders = case_ids.map((_, i) => `$${i + 1}`).join(',');
+        const result = await db.query(
+          `SELECT * FROM cases WHERE case_id IN (${placeholders})`,
+          case_ids
+        );
+        cases = result.rows.map(this.formatCase);
+      } else {
+        // Otherwise, retrieve relevant cases using existing retrieval logic
+        let sql = 'SELECT * FROM cases';
+        let params = [];
+
+        if (tags.length > 0) {
+          sql += ' WHERE tags LIKE $1';
+          params.push(`%${JSON.stringify(tags)}%`);
+        }
+
+        const result = await db.query(sql, params);
+        cases = result.rows.map(this.formatCase);
+
+        // Apply retrieval ranking
+        if (mode === 'parametric') {
+          cases = this.ai.predictCaseRelevance(cases, query, tags);
+          const confidentCases = cases.filter(c => c.confidence > AI_CONFIG.qlearning.confidenceThreshold);
+          cases = confidentCases.length >= top_k ? confidentCases : cases;
+          cases = cases.slice(0, top_k);
+        } else {
+          cases = cases
+            .map(caseItem => ({
+              ...caseItem,
+              semanticScore: this.ai.calculateSemanticSimilarity(query, caseItem.task)
+            }))
+            .filter(c => c.semanticScore > 0.1)
+            .sort((a, b) => b.semanticScore - a.semanticScore)
+            .slice(0, top_k);
+        }
+      }
+
+      if (cases.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `⚠️ No cases found to enrich context for query: "${query}"`,
+            },
+          ],
+        };
+      }
+
+      // Initialize context enrichment with similarity calculator
+      const enrichment = new ContextEnrichment(this.ai);
+
+      // Enrich context with query-relevant content
+      const enrichedContext = await enrichment.enrichPromptContext(query, cases, {
+        maxCases: top_k,
+        maxSentencesPerCase: max_sentences_per_case,
+        minRelevanceScore: min_relevance_score,
+        includeFullSolution: include_full_solution
+      });
+
+      // Format output
+      let outputText;
+      if (format === 'json') {
+        outputText = JSON.stringify(enrichedContext, null, 2);
+      } else {
+        // Use the formatting method
+        outputText = enrichment.formatContextForPrompt(enrichedContext, 'text');
+
+        // Add metadata summary
+        outputText += `\n---\n`;
+        outputText += `Summary: Enriched ${enrichedContext.totalCases} cases with average compression ratio of ${enrichedContext.averageCompressionRatio}\n`;
+        outputText += `Each case was compressed to show only the most query-relevant content.\n`;
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `✨ Context enriched for query: "${query}"\n\n${outputText}`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Failed to enrich context: ${error.message}`);
+    }
+  }
+
+  // Extract relevant tags from a question (helper method)
+  extractTagsFromQuestion(question) {
+    const commonTags = {
+      'performance': ['performance', 'optimization', 'speed', 'fast', 'slow', 'efficient'],
+      'cpu': ['cpu', 'processor', 'branch', 'prediction', 'pipeline'],
+      'memory': ['memory', 'cache', 'heap', 'stack', 'allocation'],
+      'algorithm': ['algorithm', 'sort', 'search', 'complexity', 'big-o'],
+      'array': ['array', 'list', 'vector', 'sorted', 'unsorted'],
+      'javascript': ['javascript', 'js', 'node', 'typescript'],
+      'python': ['python', 'django', 'flask'],
+      'database': ['database', 'sql', 'query', 'postgresql', 'mysql'],
+      'web': ['web', 'http', 'api', 'rest', 'frontend', 'backend'],
+      'computer-science': ['computer-science', 'cs', 'theory'],
+    };
+
+    const questionLower = question.toLowerCase();
+    const extractedTags = [];
+
+    for (const [tag, keywords] of Object.entries(commonTags)) {
+      if (keywords.some(keyword => questionLower.includes(keyword))) {
+        extractedTags.push(tag);
+      }
+    }
+
+    // Always add 'conversation' tag for cases added from conversation
+    if (!extractedTags.includes('conversation')) {
+      extractedTags.push('conversation');
+    }
+
+    return extractedTags.length > 0 ? extractedTags : ['conversation', 'general'];
+  }
+
+  // Convert Stack Overflow question to case format (helper method)
+  convertQuestionToCase(question) {
+    return {
+      case_id: `stackoverflow-${question.id}`,
+      task: question.title,
+      tags: question.tags || [],
+      solution: {
+        description: `Stack Overflow question: ${question.title}`,
+        questionBody: question.body,
+        link: question.link,
+        score: question.score,
+        viewCount: question.viewCount,
+        answerCount: question.answerCount,
+        source: 'stackoverflow',
+        sourceId: question.id.toString(),
+        ...(question.acceptedAnswer && {
+          acceptedAnswer: {
+            body: question.acceptedAnswer.body,
+            score: question.acceptedAnswer.score,
+            owner: question.acceptedAnswer.owner,
+          },
+        }),
+      },
     };
   }
 
