@@ -32,7 +32,7 @@ class MCPTester {
       });
 
       this.serverProcess.on('error', reject);
-      
+
       setTimeout(() => {
         reject(new Error('Server startup timeout'));
       }, 10000);
@@ -42,7 +42,7 @@ class MCPTester {
   async sendRequest(request) {
     return new Promise((resolve, reject) => {
       let responseData = '';
-      
+
       const timeout = setTimeout(() => {
         reject(new Error('Request timeout'));
       }, 5000);
@@ -131,6 +131,35 @@ class MCPTester {
     }
   }
 
+  async testEnrichContextTool() {
+    console.log('🧪 Testing enrich_context tool...');
+
+    // First check if tool is in the list
+    const listRequest = {
+      jsonrpc: '2.0',
+      id: 10,
+      method: 'tools/list'
+    };
+
+    try {
+      const listResponse = await this.sendRequest(listRequest);
+      const tools = listResponse.result?.tools || [];
+      const enrichContextTool = tools.find(t => t.name === 'enrich_context');
+
+      if (!enrichContextTool) {
+        console.log('❌ enrich_context tool not found in tools list');
+        return false;
+      }
+
+      console.log('✅ enrich_context tool found in tools list');
+      console.log(`   Description: ${enrichContextTool.description?.substring(0, 60)}...`);
+      return true;
+    } catch (error) {
+      console.log('❌ Failed to check enrich_context tool:', error.message);
+      return false;
+    }
+  }
+
   stopServer() {
     if (this.serverProcess) {
       this.serverProcess.kill();
@@ -149,6 +178,7 @@ class MCPTester {
       results.push(await this.testListTools());
       results.push(await this.testListResources());
       results.push(await this.testAddCase());
+      results.push(await this.testEnrichContextTool());
 
       const passed = results.filter(Boolean).length;
       const total = results.length;
