@@ -25,7 +25,13 @@ import http from 'http';
 import { ContextEnrichment } from './core/context-enrichment.js';
 
 // Load environment variables
-config();
+// LLM Configuration
+const LLM_CONFIG = {
+  provider: process.env.LLM_PROVIDER || 'openai', // 'openai' or 'anthropic'
+  apiKey: process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY || null,
+  model: process.env.LLM_MODEL || 'gpt-4o-mini',
+  baseURL: process.env.LLM_BASE_URL || null,
+};
 
 // Advanced AI Configuration
 const AI_CONFIG = {
@@ -52,6 +58,7 @@ class AdvancedAI {
     this.userPatterns = new Map();
     this.contextHistory = [];
     this.feedbackPatterns = new Map();
+    this.llmEnhancer = new LLMQueryEnhancer(LLM_CONFIG);
   }
 
   // Smart Q-Learning with decay and exploration
@@ -315,18 +322,33 @@ class SolvedBookMCPServer {
           },
           {
             name: 'retrieve_cases',
-            description: 'Retrieve cases using Q-learning (parametric) or similarity (non-parametric)',
+            description: 'Retrieve cases using Q-learning (parametric) or similarity (non-parametric). Enhanced with LLM query optimization based on available solutions and tech context.',
             inputSchema: {
               type: 'object',
               properties: {
                 query: { type: 'string', description: 'Query string for case retrieval' },
-                mode: { 
-                  type: 'string', 
+                mode: {
+                  type: 'string',
                   enum: ['parametric', 'non-parametric'],
-                  description: 'Retrieval mode: parametric (Q-value based) or non-parametric (similarity based)' 
+                  description: 'Retrieval mode: parametric (Q-value based) or non-parametric (similarity based)'
                 },
                 top_k: { type: 'number', description: 'Number of cases to retrieve (default: 5)' },
                 tags: { type: 'array', items: { type: 'string' }, description: 'Optional: Filter by tags' },
+                tech_context: {
+                  type: 'object',
+                  description: 'Optional: Technical context (stack, framework, project type, etc.) that can match against solution tags',
+                  properties: {
+                    stack: { type: 'string', description: 'Technology stack (e.g., "javascript", "python")' },
+                    framework: { type: 'string', description: 'Framework (e.g., "react", "express", "django")' },
+                    project: { type: 'string', description: 'Project type or domain' },
+                    language: { type: 'string', description: 'Programming language' },
+                    platform: { type: 'string', description: 'Platform (e.g., "web", "mobile", "backend")' },
+                  },
+                },
+                use_llm_enhancement: {
+                  type: 'boolean',
+                  description: 'Whether to use LLM to enhance the query based on available solutions (default: true)',
+                },
               },
               required: ['query'],
             },
@@ -523,19 +545,61 @@ class SolvedBookMCPServer {
   }
 
   async handleRetrieveCases(db, args) {
-    const { query, mode = 'parametric', top_k = 5, tags = [] } = args;
+    const {
+      query,
+      mode = 'parametric',
+      top_k = 5,
+      tags = [],
+      tech_context = {},
+      use_llm_enhancement = true,
+    } = args;
+
+    // Step 1: User sends init query request (already received)
+    const originalQuery = query;
+
+    // Step 2: Server lists existing solution titles
+    const solutionTitles = await this.listSolutionTitles(db, 10);
+    console.error({ solutionTitles });
+
+    // Step 3 & 4: Server sends user query with solution titles to LLM, LLM summarizes a better vector query
+    let enhancedQuery = originalQuery;
+    if (use_llm_enhancement && solutionTitles.length > 0) {
+      try {
+        enhancedQuery = await this.ai.llmEnhancer.enhanceQuery(
+          originalQuery,
+          solutionTitles,
+          tech_context
+        );
+        console.error({ enhancedQuery, originalQuery });
+      } catch (error) {
+        console.warn('LLM enhancement failed, using original query:', error.message);
+        enhancedQuery = originalQuery;
+      }
+    }
+
+    // Step 5: Server makes a query to vector DB (or similarity search)
+    // Combine tags from user input and tech context
+    const techContextTags = this.extractTagsFromTechContext(tech_context);
+    const allTags = [...new Set([...tags, ...techContextTags])];
 
     // Get all relevant cases (broader search first)
     let sql = 'SELECT * FROM cases';
     let params = [];
 
-    if (tags.length > 0) {
-      sql += ' WHERE tags LIKE $1';
-      params.push(`%${JSON.stringify(tags)}%`);
+    if (allTags.length > 0) {
+      // Match tags more effectively
+      const tagConditions = allTags.map((tag, idx) => {
+        params.push(`%${tag}%`);
+        return `tags::text ILIKE $${params.length}`;
+      }).join(' OR ');
+      sql += ` WHERE ${tagConditions}`;
     }
 
     const result = await db.query(sql, params);
     let cases = result.rows.map(this.formatCase);
+
+    // Use enhanced query for retrieval
+    const searchQuery = enhancedQuery;
 
     if (mode === 'parametric') {
       // AI-enhanced Q-learning retrieval
@@ -558,11 +622,20 @@ class SolvedBookMCPServer {
         .slice(0, top_k);
     }
 
+    // Build response with enhancement info
+    const enhancementInfo = enhancedQuery !== originalQuery
+      ? `\n\n🔍 Query Enhancement:\nOriginal: "${originalQuery}"\nEnhanced: "${enhancedQuery}"`
+      : '';
+
+    const techContextInfo = Object.keys(tech_context).length > 0
+      ? `\n\n📋 Tech Context: ${JSON.stringify(tech_context)}`
+      : '';
+
     return {
       content: [
         {
           type: 'text',
-          text: `🧠 AI-Retrieved ${cases.length} cases using ${mode} mode:\n\n${this.formatSmartRetrievalResults(cases, query, mode)}`,
+          text: `🧠 AI-Retrieved ${cases.length} cases using ${mode} mode:${enhancementInfo}${techContextInfo}\n\n${this.formatSmartRetrievalResults(cases, searchQuery, mode)}`,
         },
       ],
     };
